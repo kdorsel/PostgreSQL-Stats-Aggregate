@@ -1,5 +1,5 @@
-﻿-- Copyright (c) 2018 Chucky Ellison <cme at freefour.com>
--- Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation 
+-- Copyright (c) 2018 Chucky Ellison <cme at freefour.com>
+-- Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation
 -- files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy,
 -- modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
 -- Software is furnished to do so, subject to the following conditions:
@@ -20,6 +20,7 @@
 
 -- drop aggregate if exists stats_agg(double precision);
 -- drop function if exists _stats_agg_accumulator(_stats_agg_accum_type, double precision);
+-- drop function if exists _stats_agg_combiner(_stats_agg_accum_type, _stats_agg_accum_type);
 -- drop function if exists _stats_agg_finalizer(_stats_agg_accum_type);
 -- drop type if exists _stats_agg_result_type;
 -- drop type if exists _stats_agg_accum_type;
@@ -72,11 +73,42 @@ END;
 '
 language plpgsql;
 
+create or replace function _stats_agg_combiner(_stats_agg_accum_type, _stats_agg_accum_type)
+returns _stats_agg_accum_type AS '
+DECLARE
+	a alias for $1;
+	b alias for $2;
+	c _stats_agg_accum_type;
+	delta1 double precision;
+	delta2 double precision;
+	delta3 double precision;
+	delta4 double precision;
+BEGIN
+	delta1 = b.m1 - a.m1;
+	delta2 = delta1 * delta1;
+	delta3 = delta1 * delta2;
+	delta4 = delta2 * delta2;
+
+	c.n = a.n + b.n;
+	c.min = least(a.min, b.min);
+	c.max = greatest(a.max, b.max);
+
+	c.m1 = (a.n*a.m1 + b.n*b.m1) / c.n;
+	c.m2 = a.m2 + b.m2 + delta2 * a.n * b.n / c.n;
+	c.m3 = a.m3 + b.m3 + delta3 * a.n * b.n * (a.n - b.n)/(c.n*c.n);
+	c.m3 = c.m3 + 3.0*delta1 * (a.n*b.m2 - b.n*a.m2) / c.n;
+	c.m4 = a.m4 + b.m4 + delta4*a.n*b.n * (a.n*a.n - a.n*b.n + b.n*b.n) / (c.n*c.n*c.n);
+	c.m4 = c.m4 + 6.0*delta2 * (a.n*a.n*b.m2 + b.n*b.n*a.m2)/(c.n*c.n) + 4.0*delta1*(a.n*b.m3 - b.n*a.m3) / c.n;
+	RETURN c;
+END;
+'
+strict language plpgsql;
+
 create or replace function _stats_agg_finalizer(_stats_agg_accum_type)
 returns _stats_agg_result_type AS '
 BEGIN
 	RETURN row(
-		$1.n, 
+		$1.n,
 		$1.min,
 		$1.max,
 		$1.m1,
@@ -92,5 +124,7 @@ create aggregate stats_agg(double precision) (
 	sfunc = _stats_agg_accumulator,
 	stype = _stats_agg_accum_type,
 	finalfunc = _stats_agg_finalizer,
+	combinefunc = _stats_agg_combiner,
+	parallel = safe,
 	initcond = '(0,,, 0, 0, 0, 0)'
 );
