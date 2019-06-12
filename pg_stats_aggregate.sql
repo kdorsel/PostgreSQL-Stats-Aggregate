@@ -39,7 +39,7 @@ create type _stats_agg_result_type AS (
 	min double precision,
 	max double precision,
 	mean double precision,
-	variance double precision,
+	stddev double precision,
 	skewness double precision,
 	kurtosis double precision
 );
@@ -80,8 +80,8 @@ BEGIN
 		$1.min,
 		$1.max,
 		$1.m1,
-		$1.m2 / ($1.n - 1.0), 
-		case when $1.m2 = 0 then null else sqrt($1.n) * $1.m3 / ($1.m2 ^ 1.5) end, 
+		case when $1.n = 1 then null else sqrt($1.m2 / ($1.n - 1.0)) end,
+		case when $1.m2 = 0 then null else sqrt($1.n) * $1.m3 / ($1.m2 ^ 1.5) end,
 		case when $1.m2 = 0 then null else $1.n * $1.m4 / ($1.m2 * $1.m2) - 3.0 end
 	);
 END;
