@@ -11,6 +11,7 @@
 
 -- based on code from John D. Cook's https://www.johndcook.com/blog/skewness_kurtosis/ with permission
 -- based on code from the P2 Algorithm for Dynamic Quantiles https://www.cse.wustl.edu/~jain/papers/ftp/psqr.pdf
+-- jb is the Jarque–Bera test
 
 -- Notes:
 -- All the math is done at double precision; can easily be changed to work with numeric or single, or whatever.
@@ -58,6 +59,7 @@ create type _stats_agg_result_type AS (
 	stddev double precision,
 	skewness double precision,
 	kurtosis double precision,
+	jb double precision,
 
 	-- P2 Algorithm
 	q25 double precision,
@@ -223,15 +225,21 @@ language plpgsql strict;
 
 create or replace function _stats_agg_finalizer(_stats_agg_accum_type)
 returns _stats_agg_result_type AS '
+DECLARE
+	skew double precision;
+	kurt double precision;
 BEGIN
+	skew = case when $1.m2 = 0 then null else sqrt($1.cnt) * $1.m3 / ($1.m2 ^ 1.5) end;
+	kurt = case when $1.m2 = 0 then null else $1.cnt * $1.m4 / ($1.m2 * $1.m2) - 3.0 end;
 	RETURN row(
 		$1.cnt,
 		$1.min,
 		$1.max,
 		$1.m1,
 		case when $1.cnt = 1 then null else sqrt($1.m2 / ($1.cnt - 1.0)) end,
-		case when $1.m2 = 0 then null else sqrt($1.cnt) * $1.m3 / ($1.m2 ^ 1.5) end,
-		case when $1.m2 = 0 then null else $1.cnt * $1.m4 / ($1.m2 * $1.m2) - 3.0 end,
+		skew,
+		kurt,
+		$1.cnt * (skew*skew + kurt * kurt / 4) / 6,
 		$1.q[2],
 		$1.q[3],
 		$1.q[4]
