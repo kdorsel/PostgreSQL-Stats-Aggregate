@@ -12,6 +12,7 @@
 -- based on code from John D. Cook's https://www.johndcook.com/blog/skewness_kurtosis/ with permission
 -- based on code from the P2 Algorithm for Dynamic Quantiles https://www.cse.wustl.edu/~jain/papers/ftp/psqr.pdf
 -- jb is the Jarque–Bera test
+-- MAD - Median Absolute Deviation. Used for modified z score
 
 -- Notes:
 -- All the math is done at double precision; can easily be changed to work with numeric or single, or whatever.
@@ -20,20 +21,31 @@
 --------------------------------------------------
 -- MAKE SURE you're not using any of these names!
 
--- drop aggregate if exists stats_agg(double precision);
--- drop function if exists _stats_agg_p2_parabolic(_stats_agg_accum_type, double precision, double precision);
--- drop function if exists _stats_agg_p2_linear(_stats_agg_accum_type, double precision, double precision);
--- drop function if exists _stats_agg_accumulator(_stats_agg_accum_type, double precision);
--- drop function if exists _stats_agg_combiner(_stats_agg_accum_type, _stats_agg_accum_type);
--- drop function if exists _stats_agg_finalizer(_stats_agg_accum_type);
--- drop type if exists _stats_agg_result_type;
--- drop type if exists _stats_agg_accum_type;
+drop aggregate if exists stats_agg(double precision);
+drop function if exists _p2_parabolic(_p2_accum_type, double precision, double precision);
+drop function if exists _p2_linear(_p2_accum_type, double precision, double precision);
+drop function if exists _stats_agg_accumulator(_stats_agg_accum_type, double precision);
+drop function if exists _stats_agg_combiner(_stats_agg_accum_type, _stats_agg_accum_type);
+drop function if exists _p2_combiner(_p2_accum_type, _p2_accum_type);
+drop function if exists _p2_accumulator(_p2_accum_type, double precision);
+drop function if exists _stats_agg_finalizer(_stats_agg_accum_type);
+drop type if exists _stats_agg_result_type;
+drop type if exists _stats_agg_accum_type;
+drop type if exists _p2_accum_type;
 
 CREATE OR REPLACE FUNCTION array_sort(ANYARRAY)
 RETURNS ANYARRAY LANGUAGE SQL
 AS $$
 SELECT ARRAY(SELECT unnest($1) ORDER BY 1)
 $$;
+
+create type _p2_accum_type AS (
+	cnt bigint,
+	q double precision[],
+	n double precision[],
+	np  double precision[],
+	dn  double precision[]
+);
 
 create type _stats_agg_accum_type AS (
 	cnt bigint,
@@ -44,11 +56,8 @@ create type _stats_agg_accum_type AS (
 	m3 double precision,
 	m4 double precision,
 
-	-- P2 Algorithm
-	q double precision[],
-	n double precision[],
-	np  double precision[],
-	dn  double precision[]
+	p2 _p2_accum_type,
+	p22 _p2_accum_type
 );
 
 create type _stats_agg_result_type AS (
@@ -64,10 +73,11 @@ create type _stats_agg_result_type AS (
 	-- P2 Algorithm
 	q25 double precision,
 	q50 double precision,
-	q75 double precision
+	q75 double precision,
+	mad double precision
 );
 
-create or replace function _stats_agg_p2_parabolic(_stats_agg_accum_type, double precision, double precision)
+create or replace function _p2_parabolic(_p2_accum_type, double precision, double precision)
 returns double precision AS '
 DECLARE
 	a alias for $1;
@@ -79,7 +89,7 @@ END;
 '
 language plpgsql strict;
 
-create or replace function _stats_agg_p2_linear(_stats_agg_accum_type, double precision, double precision)
+create or replace function _p2_linear(_p2_accum_type, double precision, double precision)
 returns double precision AS '
 DECLARE
 	a alias for $1;
@@ -91,33 +101,16 @@ END;
 '
 language plpgsql strict;
 
-create or replace function _stats_agg_accumulator(_stats_agg_accum_type, double precision)
-returns _stats_agg_accum_type AS '
+create or replace function _p2_accumulator(_p2_accum_type, double precision)
+returns _p2_accum_type AS '
 DECLARE
-	a ALIAS FOR $1;
+	a alias for $1;
 	x alias for $2;
-	n1 bigint;
 	k bigint;
 	d double precision;
 	qp double precision;
-	delta double precision;
-	delta_n double precision;
-	delta_n2 double precision;
-	term1 double precision;
 BEGIN
-	n1 = a.cnt;
 	a.cnt = a.cnt + 1;
-	delta = x - a.m1;
-	delta_n = delta / a.cnt;
-	delta_n2 = delta_n * delta_n;
-	term1 = delta * delta_n * n1;
-	a.m1 = a.m1 + delta_n;
-	a.m4 = a.m4 + term1 * delta_n2 * (a.cnt*a.cnt - 3*a.cnt + 3) + 6 * delta_n2 * a.m2 - 4 * delta_n * a.m3;
-	a.m3 = a.m3 + term1 * delta_n * (a.cnt - 2) - 3 * delta_n * a.m2;
-	a.m2 = a.m2 + term1;
-	a.min = least(a.min, x);
-	a.max = greatest(a.max, x);
-
 	if a.cnt <= 5 then
 		a.q = array_append(a.q, x);
 		if a.cnt = 5 then
@@ -154,17 +147,96 @@ BEGIN
 		d = a.np[ii] - a.n[ii];
 		if (d >= 1 and a.n[ii+1] - a.n[ii] > 1) or (d <= -1 and a.n[ii-1] - a.n[ii] < -1) then
 			d = sign(d);
-			qp = _stats_agg_p2_parabolic(a, ii, d);
+			qp = _p2_parabolic(a, ii, d);
 			if qp > a.q[ii-1] and qp < a.q[ii+1] then
 				a.q[ii] = qp;
 			else
-				a.q[ii] = _stats_agg_p2_linear(a, ii, d);
+				a.q[ii] = _p2_linear(a, ii, d);
 			end if;
 			a.n[ii] = a.n[ii] + d;
 		end if;
 	end loop;
 
 	return a;
+END;
+'
+language plpgsql strict;
+
+create or replace function _stats_agg_accumulator(_stats_agg_accum_type, double precision)
+returns _stats_agg_accum_type AS '
+DECLARE
+	a ALIAS FOR $1;
+	x alias for $2;
+	n1 bigint;
+	delta double precision;
+	delta_n double precision;
+	delta_n2 double precision;
+	term1 double precision;
+	tmp _p2_accum_type;
+BEGIN
+	n1 = a.cnt;
+	a.cnt = a.cnt + 1;
+	delta = x - a.m1;
+	delta_n = delta / a.cnt;
+	delta_n2 = delta_n * delta_n;
+	term1 = delta * delta_n * n1;
+	a.m1 = a.m1 + delta_n;
+	a.m4 = a.m4 + term1 * delta_n2 * (a.cnt*a.cnt - 3*a.cnt + 3) + 6 * delta_n2 * a.m2 - 4 * delta_n * a.m3;
+	a.m3 = a.m3 + term1 * delta_n * (a.cnt - 2) - 3 * delta_n * a.m2;
+	a.m2 = a.m2 + term1;
+	a.min = least(a.min, x);
+	a.max = greatest(a.max, x);
+
+	-- Find the 25th, 50th and 75th percentiles using P2
+	a.p2 = _p2_accumulator(a.p2, x);
+	-- Postgres does not allow multi level accessing a.b.c. So t = a.b and t.c
+	tmp = a.p2;
+	if a.cnt > 5 then
+		-- Find the 50th percentile of the median absolute deviation
+		a.p22 = _p2_accumulator(a.p22, abs(x - tmp.q[3]));
+	end if;
+
+	return a;
+END;
+'
+language plpgsql strict;
+
+create or replace function _p2_combiner(_p2_accum_type, _p2_accum_type)
+returns _p2_accum_type AS '
+DECLARE
+	a alias for $1;
+	b alias for $2;
+	c _p2_accum_type;
+	addA boolean;
+	addB boolean;
+	wa double precision;
+	wb double precision;
+BEGIN
+	addA = a.cnt <= 5;
+	addB = b.cnt <= 5;
+	if addA and not addB then
+		c = b;
+	elsif addB and not addA then
+		c = a;
+	else
+		c.cnt = a.cnt + b.cnt;
+		wa = a.cnt / c.cnt::double precision;
+		wb = b.cnt / c.cnt::double precision;
+		c.q[1] = least(a.q[1], b.q[1]);
+		c.q[5] = greatest(a.q[5], b.q[5]);
+		for ii in 2..4 loop
+			c.q[ii] = a.q[ii] * wa + b.q[ii] * wb;
+		end loop;
+	end if;
+	for ii in 1..5 loop
+		if addA and ii <= a.cnt then
+			c = _stats_agg_accumulator(c, a.q[ii]);
+		end if;
+		if addB and ii <= b.cnt then
+			c = _stats_agg_accumulator(c, b.q[ii]);
+		end if;
+	end loop;
+	RETURN c;
 END;
 '
 language plpgsql strict;
@@ -179,35 +251,16 @@ DECLARE
 	delta2 double precision;
 	delta3 double precision;
 	delta4 double precision;
-	addA boolean;
-	addB boolean;
 BEGIN
-	addA = a.cnt <= 5;
-	addB = b.cnt <= 5;
-	if addA and not addB then
-		c = b;
-	elsif addB and not addA then
-		c = a;
-	else
-		c.cnt = a.cnt + b.cnt;
-		for ii in 2..4 loop
-			c.q[ii] = (a.q[ii] + b.q[ii]) / 2;
-		end loop;
-	end if;
-	for ii in 1..5 loop
-		if addA and ii <= a.cnt then
-			c = _stats_agg_accumulator(c, a.q[ii]);
-		end if;
-		if addB and ii <= b.cnt then
-			c = _stats_agg_accumulator(c, b.q[ii]);
-		end if;
-	end loop;
+	c.p2 = _p2_combiner(a.p2, b.p2);
+	c.p22 = _p2_combiner(a.p22, b.p22);
 
 	delta1 = b.m1 - a.m1;
 	delta2 = delta1 * delta1;
 	delta3 = delta1 * delta2;
 	delta4 = delta2 * delta2;
 
+	c.cnt = a.cnt + b.cnt;
 	c.min = least(a.min, b.min);
 	c.max = greatest(a.max, b.max);
 
@@ -217,6 +270,9 @@ BEGIN
 	c.m3 = c.m3 + 3.0*delta1 * (a.cnt*b.m2 - b.cnt*a.m2) / c.cnt;
 	c.m4 = a.m4 + b.m4 + delta4*a.cnt*b.cnt * (a.cnt*a.cnt - a.cnt*b.cnt + b.cnt*b.cnt) / (c.cnt*c.cnt*c.cnt);
 	c.m4 = c.m4 + 6.0*delta2 * (a.cnt*a.cnt*b.m2 + b.cnt*b.cnt*a.m2)/(c.cnt*c.cnt) + 4.0*delta1*(a.cnt*b.m3 - b.cnt*a.m3) / c.cnt;
+
+	c.p2 =  _p2_combiner(a.p2, b.p2);
+	c.p22 = _p2_combiner(a.p22, b.p22);
 
 	RETURN c;
 END;
@@ -239,10 +295,11 @@ BEGIN
 		case when $1.cnt = 1 then null else sqrt($1.m2 / ($1.cnt - 1.0)) end,
 		skew,
 		kurt,
-		$1.cnt * (skew*skew + kurt * kurt / 4) / 6,
-		$1.q[2],
-		$1.q[3],
-		$1.q[4]
+		$1.cnt * (skew * skew / 6 + kurt * kurt / 24),
+		$1.p2.q[2],
+		$1.p2.q[3],
+		$1.p2.q[4],
+		$1.p22.q[3]
 	);
 END;
 '
@@ -254,5 +311,5 @@ create aggregate stats_agg(double precision) (
 	finalfunc = _stats_agg_finalizer,
 	combinefunc = _stats_agg_combiner,
 	parallel = safe,
-	initcond = '(0,,, 0, 0, 0, 0, {}, "{1,2,3,4,5}", "{1,2,3,4,5}", "{0,0.25,0.5,0.75,1}")'
+	initcond = '(0,,, 0, 0, 0, 0, "(0, {}, \"{1,2,3,4,5}\", \"{1,2,3,4,5}\", \"{0,0.25,0.5,0.75,1}\")", "(0, {}, \"{1,2,3,4,5}\", \"{1,2,3,4,5}\", \"{0,0.25,0.5,0.75,1}\")")'
 );
